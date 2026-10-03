@@ -55,7 +55,31 @@ python3 util/uf2conv.py .build/ydkb_unicore_f1_dusk67_via.bin \
 ```
 
 Hold **Esc** while plugging the keyboard in (bootmagic -> bootloader), then
-drag the `.uf2` onto the mounted drive.
+drag the `.uf2` onto the mounted drive. That is the manual path.
+
+### Scripted flashing (firmware v0.2+)
+
+After v0.2, Esc is no longer needed — the repo can drive the whole update:
+
+```bash
+./flash-dusk67.sh              # build + flash
+./flash-dusk67.sh --uf2 FILE   # flash a prebuilt .uf2
+```
+
+The firmware implements VIA `id_bootloader_jump` (**0x0B**) in `led.c`, which
+upstream `quantum/via.c` defines in its enum but never dispatches. `0x0B` puts
+the board into its UF2 bootloader; the script then copies the artifact onto the
+bootloader's MSC volume.
+
+**One manual step is required first.** `0x0B` does not exist in v0.1, so on v0.1
+the command is ignored and the script cannot work. Flash v0.2 by hand once
+(hold Esc); every update after that is fully scripted.
+
+Verified on hardware: the script was run unattended six times, each time
+rebuilding, jumping to the bootloader over raw-HID, copying the UF2 onto the
+bootloader's MSC volume, and leaving the board back at `9d5b:2406` with all 224
+EEPROM keymap cells matching the compiled keymap. See Architecture.md §10 for
+the measured bootloader identity and the three things measurement corrected.
 
 The board has **no HSE crystal** — the 48 MHz USB clock derives from the
 internal HSI oscillator, which drifts outside the USB full-speed tolerance and

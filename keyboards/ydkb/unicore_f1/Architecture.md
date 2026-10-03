@@ -329,6 +329,17 @@ Two further facts worth keeping:
   like *stale or misattributed* data rather than erasure.
 - **`id_eeprom_reset` (0x0A) is not compiled in** (`VIA_EEPROM_ALLOW_RESET`
   undefined), so the host cannot wipe EEPROM wholesale — only 0x06 is reachable.
+  Confirmed on the live v0.2 board: 0x0A draws no self-identifying reply and
+  uptime does not move; all 224 cells still matched afterwards.
+
+**Who can actually reach the defect.** The VIA Configurator's "Reset EEPROM"
+button sends **0x0A**, not 0x06 — and 0x0A is not compiled in here, so an app
+user cannot trigger this. The only way to send 0x06 is a host script speaking
+raw-HID directly. That narrows the exposure to developers and agents probing the
+board, which is exactly how it happened here: the check that was supposed to
+*confirm* the reset worked is what broke the keymap. Real exposure, but not an
+end-user data-loss path — which is why the fix belongs in the protocol handler
+and the tools rather than in a user-facing warning.
 
 The remaining suspect is the FEE emulation's **compaction path**
 (`eeprom_compact` -> `eeprom_clear` erases *all* 8 pages, compacted area
@@ -430,3 +441,92 @@ different: an absent **default** prints `SKIP` and exits 0 (a fresh clone has
 nothing to compare against, which is not a firmware defect), while an absent
 **explicit argument** exits non-zero with `error: no such file:` — otherwise a
 typo'd path would read as a silently green check.
+
+## 10. Scripted flashing (added 2026-10-03, firmware v0.2)
+
+### Why Esc could not simply be automated
+
+Esc works through `bootmagic`, which samples the matrix during boot. There is no
+way to inject it from the host: interface 0 is a **boot-protocol keyboard**
+(`bInterfaceSubClass=1`, `bInterfaceProtocol=1`), so the Linux HID driver claims
+boot reports itself and consumes them as key events. Writing a boot report to
+`/dev/hidraw*` produces an Esc *keystroke*, not a matrix state the firmware can
+see. This is host policy, not something configurable away.
+
+### The way out: `id_bootloader_jump` (0x0B)
+
+`via.h` defines `id_bootloader_jump = 0x0B`, but **`quantum/via.c` has no case
+for it** in `raw_hid_receive` — the command is never dispatched, so a host that
+sends it gets `id_unhandled` (0xFF) and the board stays put. Meanwhile
+`led.c` already implements `bootloader_jump()` (magic `0x9d5bfc2b` at
+`0x20004000`, then `NVIC_SystemReset()`).
+
+QMK provides a sanctioned join point for exactly this: `raw_hid_receive` calls
+`via_command_kb(data, length)` *before* its own switch and returns early when it
+returns true. So a keyboard-level override bridges the two **without touching
+upstream QMK** — no submodule edit, no fork, consistent with §9:
+
+```c
+bool via_command_kb(uint8_t *data, uint8_t length) {
+    if (data[0] != id_bootloader_jump) return false;
+    raw_hid_send(data, length);
+    wait_ms(20);
+    bootloader_jump();
+    return true;   /* not reached */
+}
+```
+
+Verified in the linked image, not just the source: `via_command_kb` is a strong
+`T` symbol (the weak default in `via.c` is overridden), and `raw_hid_receive`
+disassembles to `bl via_command_kb` followed by `cmp r3, #11`.
+
+### Do not depend on the reply
+
+The firmware queues a reply and then resets within microseconds, while USB polls
+the endpoint only every 1 ms — so a reply is **not guaranteed** to leave the
+board.
+
+**Measured 2026-10-03: it did arrive** (`reply[0] = 0x0b`) on this host. An
+earlier revision of this section asserted it could not, which was an over-claim
+from reasoning about poll timing rather than observation; the measurement
+corrected it. The design does not change — `flash-dusk67.sh` still treats
+"the device disappeared from the bus" as the success signal, because a reply
+that depends on poll alignment is not something to build a flash on, and because
+a *missing* reply would be indistinguishable from a reset that never happened.
+
+### The one-time manual step
+
+`0x0B` only exists in **v0.2 and later**. On v0.1 the command is ignored, so the
+script cannot work. Therefore:
+
+1. hold **Esc** while plugging in, and flash the v0.2 `.uf2` by hand (once);
+2. from then on `./flash-dusk67.sh` needs no hands at all.
+
+This looks circular but is not: the first manual flash installs the very handler
+that automates every later flash.
+
+### Measured on hardware (2026-10-03)
+
+v0.2 was flashed once by hand, then the script ran **unattended six times**, each
+time ending with the board back at `9d5b:2406` and all 224 EEPROM cells
+matching `keymap.c`.
+
+Three things were guessed wrong and corrected by measurement:
+
+1. **The bootloader's USB id is not a `9d5b` id.** It enumerates as
+   **`1209:db42`** — "Generic Devan Lai dapboot DFU bootloader" (picode's
+   generic VID/PID), exposing a 3.9 MB vfat volume labelled **`UniCore-F1`**.
+   An earlier draft carried a guessed `9d5b:0000`; it was wrong.
+2. **The USB device appears before its block node.** Waiting for the USB id is
+   not sufficient — the first run failed because `bootloader_device()` was
+   called once, immediately, before `/dev/sdX` existed. The script now polls
+   for the volume itself.
+3. **`--uf2` deleted the caller's own file.** The EXIT cleanup referenced a
+   `main()` local after `main()` had returned (an unbound-variable error under
+   `set -u`), and then the same cleanup was pointed at the user-supplied path.
+   The artifact path is now file-scoped and is only recorded for deletion when
+   *we* made the file.
+
+Mounting uses `udisksctl`, so no root is needed. Verified properties worth
+keeping: a caller-supplied `--uf2` is never deleted; the build path's own temp
+file always is; both paths exit 0.

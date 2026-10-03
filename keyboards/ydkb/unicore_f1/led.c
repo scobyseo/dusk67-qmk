@@ -29,6 +29,8 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include <hal.h>
 #include "quantum.h"
 #include "via.h"
+#include "raw_hid.h"
+#include "wait.h"
 #include "ws2812.h"
 #include "switch_board.h"
 #include "command.h"
@@ -138,6 +140,35 @@ void bootloader_jump(void) {
 /* Entering the bootloader via Esc/bootmagic must NOT wipe the EEPROM
  * (preserves the user's saved keymap); eeprom reset stays explicit. */
 void bootmagic_reset_eeprom(void) {}
+
+/* VIA has no case for id_bootloader_jump (0x0B) in quantum/via.c's
+ * raw_hid_receive switch -- the command exists in the enum (via.h) but is
+ * never dispatched, so a host that sends it gets id_unhandled (0xFF) back and
+ * the board stays in the application. This is the sanctioned keyboard-level
+ * hook (via.c calls via_command_kb *before* its own switch and honours a true
+ * return), so implementing it here needs no change to upstream QMK.
+ *
+ * Purpose: let a host script put the board into its UF2 bootloader over
+ * raw-HID, so a firmware update does not need Esc held by hand at plug-in.
+ *
+ * On the reply: the reset below happens within microseconds while a USB poll
+ * is only every 1 ms, so a reply queued by raw_hid_send() is NOT reliably
+ * delivered. It is sent anyway (harmless, and it lands on hosts that happen to
+ * poll first) but callers must treat "the device vanished from the bus" as the
+ * success signal, never the reply. flash_dusk67.sh does exactly that.
+ *
+ * The delay before resetting exists only to give the queued report a chance to
+ * drain; it is not load-bearing for correctness.
+ */
+bool via_command_kb(uint8_t *data, uint8_t length) {
+    if (data[0] != id_bootloader_jump) {
+        return false;
+    }
+    raw_hid_send(data, length);
+    wait_ms(20);
+    bootloader_jump();
+    return true; /* not reached: bootloader_jump() resets the MCU */
+}
 
 /* LShift+RShift+LCtrl+B -> bootloader; without Ctrl -> soft reset. */
 bool command_extra(uint8_t code) {

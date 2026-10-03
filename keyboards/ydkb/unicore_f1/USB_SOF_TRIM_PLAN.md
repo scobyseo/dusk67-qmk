@@ -193,10 +193,25 @@ The same broken log still exists in `~/work/vial-qmk-tip`
 - Dropped by design: SOCD (`action.c`), `tmk_core/protocol/ble51/` BLE stack,
   ps2/AVR-suspend patches — irrelevant to a wired Dusk67.
 
-## Flashing (both projects)
+## Flashing
 
+```bash
+python3 util/uf2conv.py .build/ydkb_unicore_f1_dusk67_via.bin \
+    -b 0x8004000 -c -f 0x9d5bcf10 -o dusk67_via.uf2
+# hold Esc while plugging in → drag dusk67_via.uf2 onto the UF2 drive
 ```
-make ydkb/unicore_f1:dusk67_vial
-util/uf2conv.py ydkb_unicore_f1_dusk67_vial.bin -b 0x8004000 -c -f 0x9d5bcf10 -o dusk67.uf2
-# hold Esc while plugging in → drag dusk67.uf2 onto the UF2 drive
+
+## Scripted flashing (v0.2 and later)
+
+Once v0.2 is on the board, Esc is no longer needed. The repo root has
+`flash-dusk67.sh`:
+
+```bash
+./flash-dusk67.sh              # build + flash
+./flash-dusk67.sh --uf2 FILE   # flash a prebuilt .uf2
 ```
+
+It sends VIA `id_bootloader_jump` (**0x0B**) over raw-HID, the firmware calls
+`bootloader_jump()`, and the script copies the UF2 onto the bootloader's MSC
+volume. See Architecture.md §10 for why 0x0B needed a keyboard-level handler and
+what the one-time manual step is.
