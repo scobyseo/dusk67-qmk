@@ -24,24 +24,25 @@ keyboards/ydkb/unicore_f1/          the keyboard (this repo's actual content)
 docs/                               VIA definition + layout notes
 ```
 
-The keyboard must live inside the submodule's working tree for QMK to find it,
-so after cloning:
+## Getting started
 
 ```bash
-git clone --recurse-submodules <this-repo>
-# or, in an existing clone:
-git submodule update --init --recursive
+git clone --recurse-submodules https://github.com/scobyseo/dusk67-qmk.git
+cd dusk67-qmk
+./sync-qmk.sh
 ```
 
-If you add the keyboard by hand instead, put it at
-`qmk_firmware/keyboards/ydkb/unicore_f1/`.
+`sync-qmk.sh` copies the keyboard into the submodule, because QMK only finds
+keyboards inside its own tree and a submodule checkout wipes anything placed
+there. Run it after any `git submodule update`; it verifies the copy rather
+than trusting `cp`.
 
 ## Build
 
-Requires an ARM toolchain (tested with `arm-none-eabi-gcc` 13.2.Rel1):
+Requires an ARM toolchain (`arm-none-eabi-gcc`, tested with 13.2.Rel1) on your
+`PATH`. Then:
 
 ```bash
-export PATH=~/work/toolchain-arm-gnu-13.2/bin:$PATH
 cd qmk_firmware
 make ydkb/unicore_f1:dusk67_via
 ```
@@ -62,6 +63,13 @@ makes the keyboard randomly "tear off" from the OS. `usb_sof_trim.c` fixes this
 in software by trimming HSI against the host's 1 kHz SOF frames. See
 `keyboards/ydkb/unicore_f1/USB_SOF_TRIM_PLAN.md`.
 
+### Verified
+
+This was built and verified from a fresh `git clone --recurse-submodules` of
+the published repository: the resulting binary is byte-identical to the local
+one (`30564` bytes, md5 `93dfabcb4d5e012f9f41cbaba2540a3b`), and so is the
+UF2 (`719bd42bcb074dcce855703d85523506`).
+
 ## Checks
 
 `qmk lint` is the canonical gate. The two scripts in the keyboard directory are
@@ -69,14 +77,17 @@ in software by trimming HSI against the host's 1 kHz SOF frames. See
 are not a test suite:
 
 ```bash
+cd qmk_firmware
 qmk lint -kb ydkb/unicore_f1
-python3 keyboards/ydkb/unicore_f1/check_via_json.py [definition.json]
-python3 keyboards/ydkb/unicore_f1/check_keymap.py    [export.json]
+make ydkb/unicore_f1:dusk67_via:via_json      # VIA definition vs this firmware
+make ydkb/unicore_f1:dusk67_via:keymap_check  # keymap vs the layout export
 ```
 
-Both scripts need a reference file that is not in this repo. Given an explicit
-path they check it; with no path they print `SKIP` and exit 0. An explicit path
-that does not exist is an error, not a skip.
+Both checks default to the reference files in `docs/`, so they work with no
+arguments. Pass a path to check a different file. If no reference file can be
+found at all they print `SKIP` and exit 0, since a missing reference is not a
+firmware defect; a path you passed explicitly that does not exist is an error,
+so a typo cannot read as silently green.
 
 ## Layout options
 
