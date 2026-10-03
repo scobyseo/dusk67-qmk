@@ -269,10 +269,25 @@ The keycode args are **(layer, row, column)** — *not* a flat offset. An early
 probe passed a flat offset and decoded bytes [4:6] and produced confident
 garbage; treat any readback script that does not echo-check as unverified.
 
-For the buffer commands (`0x12`/`0x13`) the args are different: `offset` is a
-**2-byte big-endian** value at `[2..3]` and `size` (max 28) is at `[4]`. Reading
-those with a single offset byte silently yields zeros and looks like a wiped
-keymap.
+### The buffer commands are offset-relative — this caused a false alarm
+
+`0x12`/`0x13` take a different layout: `offset` is **2-byte big-endian** at
+`[2..3]`, `size` (max 28) at `[4]`, and the reply's payload starts at index 4
+(`via.c` writes it at `&command_data[3]`, which is `data[4]`, and hidapi has
+already stripped the report-ID byte at `data[0]`).
+
+The decisive detail, measured: **the offset is relative to
+`DYNAMIC_KEYMAP_EEPROM_START`, not to the start of EEPROM.** Reading a cell via
+`0x12` needs `(layer*112 + row*8 + col)*2` — adding the 264-byte base address
+instead reads a *different cell's* bytes.
+
+Getting this wrong made all 8 previously-broken cells look wrong through the
+buffer while `0x04` reported them correct, which briefly looked like evidence of
+a decoding artifact in the defect itself. It was an artifact of the probe. With
+relative offsets, `0x12`, `0x04` and flash now agree on all 8 cells.
+
+The 264-byte base itself was re-measured by sentinel scan under v0.2 and is
+unchanged.
 
 ### 7.2 An EEPROM reset command damaged 8 cells — do not send 0x06 casually
 
@@ -304,6 +319,19 @@ Properties measured about this, so it is not re-derived:
 
 **Root cause: still open.** What has been *ruled out* by measurement, so it is
 not re-derived:
+
+- **It does not reproduce on v0.2.** After flashing v0.2, command 0x06 was sent
+  five times in a row from a verified-clean board; every time all 224 cells
+  matched flash afterwards. The "8 cells always break" claim was measured under
+  **v0.1** and does not carry over unchanged. Something differs between the two
+  builds or between the EEPROM states they inherited, and that difference is
+  still unidentified — so this is *unexplained*, not *fixed*.
+- **A sentinel cell is written correctly.** Writing `0xBEEF` into one of the
+  affected cells and then sending 0x06 restores the correct flash value, so the
+  reset's own `dynamic_keymap_set_keycode()` writes do reach those cells. That
+  rules out "the corruption happens outside the keymap write path" and localises
+  the fault to what differs *before* the write — i.e. what the EEPROM held or
+  which byte the write targeted.
 
 - **Not an EEPROM capacity overflow.** QMK's own assert passes. Measured EEPROM
   geometry (STM32F103xB, `FEE_PAGE_SIZE` 0x400 x `FEE_PAGE_COUNT` 8, from
@@ -421,11 +449,12 @@ tool here. If the keymap is ever genuinely lost, use Esc-bootmagic instead.
   labelled `BL_TOGG` but the firmware left `KC_NO`.
 - Tree is rebased to **`origin/master` tip** (`7a1bbf37c5`), 0 ahead / 0 behind.
   Build + lint + both static checkers green after the rebase.
-- Flashed, VIA-live, and **EEPROM keymap readback verified against the ELF**
-  (§7.1). Outstanding: the `0x06` reset defect in §7.2. Root cause **not
-  established**; capacity, address-width, byte-order, misalignment, alignment and
-  reboot hypotheses are all measured and excluded, and the compaction path
-  remains an untested hypothesis.
+- Flashed (v0.2), VIA-live, **EEPROM keymap readback verified against the ELF**
+  (§7.1), and firmware updates are now hands-free (§10).
+- Outstanding: the `0x06` defect in §7.2 **does not reproduce on v0.2** — five
+  consecutive resets leave all 224 cells correct. Root cause **not established**,
+  and the v0.1-vs-v0.2 difference is itself unidentified. Treat 0x06 as unsafe
+  until that is explained; do not read "did not reproduce" as "fixed".
 
 ## 8. If you are handed a new bug while using the keyboard
 
@@ -434,7 +463,8 @@ Fast triage, in order:
 1. Is it *reproducible with the board unplugged and replugged*? If yes, likely
    EEPROM/keymap, not runtime. Reflash (§3) and run `via_readback.py` (§7.1) —
    it names the exact cells that disagree with flash. Do **not** try to fix it
-   by sending VIA `0x06`; that command is itself unsafe here (§7.2).
+   by sending VIA `0x06`; it corrupted cells under v0.1 and the cause is still
+   unknown (§7.2), even though it does not currently reproduce under v0.2.
 2. Is USB dropping mid-typing? That is the **HSI tear-off** issue — go to
    `USB_SOF_TRIM_PLAN.md`, not here. It is a clock problem, and no VIA log will
    show it because a dead transport silences the log exactly when you need it.

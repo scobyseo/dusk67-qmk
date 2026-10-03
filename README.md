@@ -125,9 +125,9 @@ python3 keyboards/ydkb/unicore_f1/via_readback.py
 ```
 
 It only sends read commands, and refuses by name any command that would write
-EEPROM — in particular `id_dynamic_keymap_reset` (0x06), which on this keyboard
-leaves 8 cells disagreeing with flash (Architecture.md §7.2; not yet root
-caused).
+EEPROM — in particular `id_dynamic_keymap_reset` (0x06), which corrupted 8 cells
+under v0.1 and whose cause is still unknown, even though it does not currently
+reproduce under v0.2 (Architecture.md §7.2).
 
 ## Layout options
 
