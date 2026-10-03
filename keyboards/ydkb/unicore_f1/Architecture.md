@@ -165,11 +165,18 @@ time; the doc exists so they are not re-derived.
 
 2. **"4 of 5 layout options are inert / a firmware gap" — FALSE.**
    A VIA layout option does **not** require a firmware-side decoder. Keys carry
-   a `group,option` legend; the configurator app draws a different key per
-   option value. Verified against `@the-via/reader`'s `kle-parser.js`. So
-   Split Backspace / ISO Enter / Split LShift / Space Row are all *app-side* and
-   need no firmware bit; only CapsLock Color is decoded in firmware (`led.c`,
-   3 bits x 3 indicators). **Do not go implement firmware decoders for 0–3.**
+   a `group,option` legend; the configurator app draws a different key per option
+   value. Verified against `@the-via/reader`'s `kle-parser.ts` (TypeScript in the
+   current tree, not `.js`). So Split Backspace / ISO Enter / Split LShift /
+   Space Row are all *app-side* and need no firmware bit; only CapsLock Color is
+   decoded in firmware (`led.c`, 3 bits x 3 indicators). **Do not go implement
+   firmware decoders for 0–3.**
+
+   The transport framing was cross-checked against `the-via/app` itself
+   (`src/shims/node-hid.ts`, `src/utils/keyboard-api.ts`) — see §7.2's framing
+   table. The app and this document agree: 33 padded bytes plus a leading
+   report-ID byte, and replies are matched on an echo of both the command and its
+   arguments.
 
 3. **KLE decals are NOT sticky.** A `{"d": true}` decoration object applies to
    **the next key only**. Treating `d` as sticky reclassifies every
@@ -332,14 +339,51 @@ Two further facts worth keeping:
   Confirmed on the live v0.2 board: 0x0A draws no self-identifying reply and
   uptime does not move; all 224 cells still matched afterwards.
 
-**Who can actually reach the defect.** The VIA Configurator's "Reset EEPROM"
-button sends **0x0A**, not 0x06 — and 0x0A is not compiled in here, so an app
-user cannot trigger this. The only way to send 0x06 is a host script speaking
-raw-HID directly. That narrows the exposure to developers and agents probing the
-board, which is exactly how it happened here: the check that was supposed to
-*confirm* the reset worked is what broke the keymap. Real exposure, but not an
-end-user data-loss path — which is why the fix belongs in the protocol handler
-and the tools rather than in a user-facing warning.
+**Who can actually reach the defect — checked against the app's own source,
+not against my own tooling.** This matters: judging the protocol by a script I
+wrote myself would be circular, so the reference here is `the-via/app`, the
+Configurator itself (`src/utils/keyboard-api.ts`, read 2026-10-03):
+
+```ts
+enum APICommand {
+  DYNAMIC_KEYMAP_SET_KEYCODE = 0x05,
+  //  DYNAMIC_KEYMAP_CLEAR_ALL = 0x06,     <-- COMMENTED OUT
+  EEPROM_RESET                = 0x0a,
+  BOOTLOADER_JUMP             = 0x0b,
+}
+async resetEEPROM() { await this.hidCommand(APICommand.EEPROM_RESET); }
+```
+
+Two things follow, and the second one is stronger than I expected:
+
+1. **The Configurator's "Reset EEPROM" sends 0x0A, and 0x0A is not compiled in
+   here.** So an app user cannot trigger this defect at all.
+2. **0x06 is not merely unused by the app — it is deliberately commented out of
+   the app's command enum.** The project that owns this protocol has already
+   marked "clear all dynamic keymap" as a command the configurator must not
+   send. The exposure is therefore limited to hand-written raw-HID scripts.
+
+That is the honest scope: a real hazard for anyone probing the board by hand,
+not a user-facing data-loss path. It also means the fix belongs in the handler
+and the tools, not in a user-facing warning.
+
+### Cross-checked against the Configurator's own framing
+
+My readback tool is not the yardstick; `the-via/app` is. The two agree:
+
+| | Configurator (`node-hid.ts` / `keyboard-api.ts`) | `via_readback.py` |
+|---|---|---|
+| report size | 33 padded + 1 report-ID byte | 34 written, 32 read |
+| write path | `sendReport(0, new Uint8Array(arr.slice(1)))` | writes byte 0, reads it back stripped |
+| byte 0 | `COMMAND_START = 0x00`, "really a HID Report ID" | treated as the report id, not a field |
+| reply match | `eqArr(commandBytes.slice(1), buffer.slice(0, len-1))` — compares **command and args** | `reply[0]==cmd && reply[1..3]==args` |
+| stale frames | `fastForwardGlobalBuffer(lastWriteTimestamp)` drops pre-write timestamps | a reply that fails the echo match is retried |
+
+So the Configurator **does** validate the echo on command *and* arguments, which
+is what made the 224-cell readback trustworthy here. One difference worth
+recording: it filters stale frames by **timestamp** while this tool filters by
+**echo mismatch**; the echo check is strictly stronger, since a queued frame
+from an earlier request can share a timestamp window.
 
 The remaining suspect is the FEE emulation's **compaction path**
 (`eeprom_compact` -> `eeprom_clear` erases *all* 8 pages, compacted area
