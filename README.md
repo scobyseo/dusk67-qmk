@@ -126,8 +126,10 @@ python3 keyboards/ydkb/unicore_f1/via_readback.py
 
 It only sends read commands, and refuses by name any command that would write
 EEPROM — in particular `id_dynamic_keymap_reset` (0x06), which corrupted 8 cells
-under v0.1 and whose cause is still unknown, even though it does not currently
-reproduce under v0.2 (Architecture.md §7.2).
+under v0.1. It does not reproduce under v0.2, and a driver trace shows why: the
+reset performs **zero writes**, because every byte already matches flash, so
+there is no write log and no compaction. What made those bytes differ under
+v0.1 is still unknown — unexplained, not fixed (Architecture.md §7.2).
 
 ## Layout options
 

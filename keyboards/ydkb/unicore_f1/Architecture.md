@@ -278,16 +278,24 @@ already stripped the report-ID byte at `data[0]`).
 
 The decisive detail, measured: **the offset is relative to
 `DYNAMIC_KEYMAP_EEPROM_START`, not to the start of EEPROM.** Reading a cell via
-`0x12` needs `(layer*112 + row*8 + col)*2` — adding the 264-byte base address
-instead reads a *different cell's* bytes.
+`0x12` needs `(layer*112 + row*8 + col)*2` — adding the base address instead
+reads a *different cell's* bytes.
 
 Getting this wrong made all 8 previously-broken cells look wrong through the
 buffer while `0x04` reported them correct, which briefly looked like evidence of
 a decoding artifact in the defect itself. It was an artifact of the probe. With
 relative offsets, `0x12`, `0x04` and flash now agree on all 8 cells.
 
-The 264-byte base itself was re-measured by sentinel scan under v0.2 and is
-unchanged.
+**The base is 42, and it was 42 all along.** An earlier revision of this file
+called 264 "measured" — that was wrong, and the error is worth recording because
+it is the same class of mistake twice: a sentinel scan was fed an *absolute*
+offset to a command that takes a *relative* one, so the "measured" 264 was just
+the cell index, not an address. The EEPROM driver's own trace settles it: a
+`0x06` reset's very first keymap read is at EEPROM `0x2a` = 42 and returns
+`0x7C16`, which is exactly `keymaps[0][0][0]` (`QK_GESC`). 42 is what
+`nvm_eeprom_via_internal.h`'s macro chain predicts
+(`EECONFIG_SIZE` 37 + 3 magic + 2 layout options), so the macros were right and
+the measurement was wrong.
 
 ### 7.2 An EEPROM reset command damaged 8 cells — do not send 0x06 casually
 
@@ -337,16 +345,15 @@ not re-derived:
   geometry (STM32F103xB, `FEE_PAGE_SIZE` 0x400 x `FEE_PAGE_COUNT` 8, from
   `config.h`): `FEE_PAGE_BASE_ADDRESS` = `0x0801E000` (matches the linker's 8 KB
   reservation exactly), compacted area `0x0801E000..0x0801E800` (2048 B),
-  write log `0x0801E800..0x08020000` (6144 B). `DYNAMIC_KEYMAP_EEPROM_START`
-  measured empirically as **264** (sentinel scan — *not* the 42 that the
-  `via.h` macro chain predicts; the difference is `EECONFIG_KB_DATA_SIZE` /
-  `VIA_EEPROM_CUSTOM_CONFIG_SIZE`, which the build injects). Highest cell byte
-  address is 1606, comfortably inside 2048.
+  write log `0x0801E800..0x08020000` (6144 B). `DYNAMIC_KEYMAP_EEPROM_START` is
+  **42** (see the correction in §7.1), so the highest cell byte address is
+  42 + 1343 = 1385, comfortably inside 2048.
 - **Not the 13-bit write-log address field.** `eeprom_write_log_word_entry`
   masks `address &= 0x1FFF`, which looked like a limit at first. Max address
-  here is 1606 (11 bits after the `<<1`), so nothing is truncated.
+  here is 1385 (12 bits after the `<<1`), so nothing is truncated.
 - **Not the `FEE_BYTE_RANGE` (0x80) byte-log/word-log split.** All keymap
-  addresses are >= 264, so every cell takes the word-log path.
+  addresses are >= 42, and the word-log path is used from 0x80 up; only a handful
+  of cells fall in the byte-log range, which cannot explain 8 specific cells.
 - **Not byte-order or a word-swap inside the cell.** In all 8 failures the high
   byte is correct and only the **low** byte is wrong — so it is not an
   endianness bug in `nvm_dynamic_keymap`'s big-endian store.
@@ -413,15 +420,46 @@ recording: it filters stale frames by **timestamp** while this tool filters by
 **echo mismatch**; the echo check is strictly stronger, since a queued frame
 from an earlier request can share a timestamp window.
 
-The remaining suspect is the FEE emulation's **compaction path**
-(`eeprom_compact` -> `eeprom_clear` erases *all* 8 pages, compacted area
-included, then rewrites the compacted image from the RAM cache; note it skips
-words whose value is 0, since `~0x0000 == 0xFFFF == FEE_EMPTY_WORD`). A
-672-write reset is exactly the workload that would push the 6 KB write log to
-full and trigger compaction. **This is a hypothesis, not a finding** — it needs
-the driver's own trace (`DEBUG_EEPROM_OUTPUT`, a commented-out `#define` at
-`eeprom_legacy_emulated_flash.c:159`, so it needs a source edit and a
-console-enabled reflash to observe). That has not been done.
+### The compaction hypothesis is now DISPROVED (driver trace, 2026-10-03)
+
+Built with `CONSOLE_ENABLE=yes EXTRAFLAGS="-DEEPROM_TRACE_PROBE -DSOF_TRIM_DEBUG"`
+plus a one-line `#define DEBUG_EEPROM_OUTPUT` in the driver (both reverted
+afterwards; the submodule is pristine and `led.c` carries no probe). Console
+output arrives on the 4th HID interface, `/dev/hidraw4`.
+
+Observed across one `0x06` on the v0.2 board:
+
+| driver event | count |
+|---|---|
+| `EEPROM_ReadDataByte` | 58+ (contiguous, `0x2a`..`0x63`) |
+| read bytes differing from flash | **0** |
+| `FLASH_ProgramHalfWord` | **0** |
+| write-log entries (byte or word) | **0** |
+| `[DIRECT]` compacted-area writes | **0** |
+| `eeprom_compact()` / `eeprom_clear` | **0** |
+| `[SKIP SAME]` | 0 (suppression is silent in this driver) |
+
+So `eeprom_update_byte()` found `orig == value` for every byte and **wrote
+nothing at all**. With no writes there is no write log, no log pressure and no
+compaction — which is precisely why 0x06 does not reproduce on v0.2. **The
+compaction hypothesis is dead.**
+
+This also means the v0.1 corruption, if it was ever real, came from a state in
+which those bytes *did* differ — the reset then had work to do and took a path
+this trace never exercised. The trigger for that difference is still unknown.
+
+### What this trace did NOT establish
+
+**The log is lossy.** The EEPROM stream ends in a torn fragment (`EEPROM 0x01`)
+and the console pads each message into its own HID report (812 zero-pad runs in
+61 KB), so report boundaries cut through lines and at least one report was never
+delivered. **58 is a lower bound, not a total.** A full 6x14x8 reset would issue
+1344 reads, so it is not established that the reset visited more than 29 cells
+or where it stopped.
+
+The obvious fix is to rebuild *without* `-DSOF_TRIM_DEBUG`: the SOF-trim log
+produced 811 of the 872 captured lines and is pure noise here, which is what
+pushed the EEPROM output out of reports. That rebuild has not been done.
 
 Also note `via_eeprom_is_valid()` encodes `QMK_BUILDDATE` as BCD **YYMMDD**
 (`quantum/via.c:71`, indices 2-3/5-6/8-9 = year, month, day) — so the magic
@@ -451,10 +489,15 @@ tool here. If the keymap is ever genuinely lost, use Esc-bootmagic instead.
   Build + lint + both static checkers green after the rebase.
 - Flashed (v0.2), VIA-live, **EEPROM keymap readback verified against the ELF**
   (§7.1), and firmware updates are now hands-free (§10).
-- Outstanding: the `0x06` defect in §7.2 **does not reproduce on v0.2** — five
-  consecutive resets leave all 224 cells correct. Root cause **not established**,
-  and the v0.1-vs-v0.2 difference is itself unidentified. Treat 0x06 as unsafe
-  until that is explained; do not read "did not reproduce" as "fixed".
+- Outstanding: the `0x06` defect in §7.2. It **does not reproduce on v0.2**, and
+  a driver trace explains why — the reset performs **zero writes** because every
+  byte already matches flash, so there is no write log and no compaction. The
+  compaction hypothesis is disproved. What made those bytes differ under v0.1
+  is still unknown, so this is unexplained, not fixed. Treat 0x06 as unsafe
+  until that is established.
+- The EEPROM keymap base is **42** (`EECONFIG_SIZE` 37 + 3 magic + 2 layout
+  options). An earlier claim of a "measured 264" was a units error — an absolute
+  offset passed to the offset-relative `0x12` — and is corrected in §7.1.
 
 ## 8. If you are handed a new bug while using the keyboard
 
