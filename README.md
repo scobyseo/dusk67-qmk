@@ -89,6 +89,22 @@ found at all they print `SKIP` and exit 0, since a missing reference is not a
 firmware defect; a path you passed explicitly that does not exist is an error,
 so a typo cannot read as silently green.
 
+### Reading the keymap back off the board
+
+`via_readback.py` is a third, **hardware-attached** check: it reads every
+`(layer, row, col)` keymap cell over the VIA raw-HID interface and diffs it
+against `keymaps/dusk67_via/keymap.c`. It needs the udev rule from
+`keyboards/ydkb/unicore_f1/Architecture.md` §5 and the keyboard plugged in.
+
+```bash
+python3 keyboards/ydkb/unicore_f1/via_readback.py
+```
+
+It only sends read commands, and refuses by name any command that would write
+EEPROM — in particular `id_dynamic_keymap_reset` (0x06), which on this keyboard
+leaves 8 cells disagreeing with flash (Architecture.md §7.2; not yet root
+caused).
+
 ## Layout options
 
 | Option | Values |

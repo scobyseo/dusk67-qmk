@@ -56,17 +56,31 @@ make ydkb/unicore_f1:dusk67_via     # -> .build/ydkb_unicore_f1_dusk67_via.bin
 qmk lint -kb ydkb/unicore_f1        # -> "Lint check passed!"
 ```
 
-The two ad-hoc checks are also wired to make targets, so they take a reference
-file the same way `check_*.py` do when called directly:
+The two ad-hoc static checks are also wired to make targets, so they take a
+reference file the same way `check_*.py` do when called directly:
 
 ```bash
 make ydkb/unicore_f1:dusk67_via via_json     VIA_JSON=../docs/dusk67_via.json
 make ydkb/unicore_f1:dusk67_via keymap_check KEYMAP_EXPORT=../docs/dusk67.layout.json
 ```
 
+There is a third ad-hoc check, and it is the only one that touches hardware —
+`via_readback.py` reads the EEPROM keymap off the board and diffs it against
+`keymap.c`:
+
+```bash
+python3 keyboards/ydkb/unicore_f1/via_readback.py [/dev/hidraw2]
+```
+
+It needs the udev rule (§5) and the keyboard plugged in. It resolves expected
+keycode values by parsing this QMK tree's own `quantum/keycodes.h`, so it has
+no hand-written keycode table to drift out of sync. See §7 for what it found
+and what it cost.
+
 Both `check_*` scripts are **ad-hoc**, not upstream CI. `check_keymap.py` guards
 the hand transcription from `dusk67.layout.json`; it is what caught a missing
 `KC_APPLICATION` alias and a dropped matrix row during development.
+`via_readback.py` is the hardware-attached third check (§3, §7.1).
 
 Flash artifact (regenerate after every change):
 ```bash
@@ -97,8 +111,16 @@ echo it. Measured working commands:
 |---|---|---|
 | `0x01` | get protocol version | `0x0D 0x00` = **13** |
 | `0x02 0x01` | uptime | non-zero once running |
-| `0x02 0x03` | layout options (value id) | layout-option bits |
-| `0x04 <layer> <offset>` | dynamic keymap get | keycode at bytes 4–5, big-endian |
+| `0x02 0x02` | layout options (value id) | layout-option bits |
+| `0x02 0x04` | firmware version | `0x00 0x00 0x00 0x01` = `VIA_FIRMWARE_VERSION` |
+| `0x04 <layer> <row> <col>` | dynamic keymap get | keycode at bytes 4–5, big-endian |
+
+**`0x02 0x03` is `id_switch_matrix_state`, not layout options.** The layout
+options value id is **0x02** (`quantum/via.h`, `enum via_keyboard_value_id`).
+Reading `0x03` returns the matrix state word and looks like a plausible
+all-zero answer, which is exactly how the wrong id survives review. Earlier
+revisions of this section used `0x03`; the `0x03000000` figure recorded in §7
+came from that mistake and should not be cited.
 
 Worked example:
 ```python
@@ -162,25 +184,73 @@ time; the doc exists so they are not re-derived.
    current `usb_sof_trim.c` was fixed to read USB hardware registers directly
    and links on any QMK base. (Recorded in `USB_SOF_TRIM_PLAN.md` §.)
 
+6. **"The bulk readback scramble was a device/EEPROM fault" — FALSE.** It was
+   entirely the host probe. Two separate host-side bugs, both measured
+   (2026-10-03):
+   - **`/dev/hidraw*` returns 32 bytes, not 34.** hidapi strips the report ID,
+     so a 34-byte VIA report reads as 32. A 34-byte `read()` therefore
+     short-reads or blocks, and every reply gets rejected — which looks
+     identical to "the board is not answering".
+   - **The layout-options value id is 0x02, not 0x03** (see §4). `0x03` is
+     `id_switch_matrix_state`.
+   Once replies are matched on *both* the command echo and the echoed
+   (layer,row,col), all 224 cells read cleanly, repeatably, with **zero** stale
+   frames out of 228. The EEPROM was never scrambled.
+
+7. **The Vial export is not a suspect for EEPROM drift.** Checked rather than
+   assumed: `check_keymap.py` passes (every token in `keymap.c` matches
+   `dusk67.layout.json`), the only `d:true` decal in `layouts.keymap[0]`
+   applies to the single entry `'0,0\n\n\n4,0'`, and cell (0,0)'s token
+   `KC_GESC` → `QK_GESC` = `0x7C16` is present **in flash** (verified by
+   disassembling the `keymaps` symbol at `0x0800abb8`). A hand transcription
+   cannot put a wrong value into EEPROM; it can only make the firmware disagree
+   with the export.
+
 ## 7. Hardware validation (2026-10-03, after flashing)
 
 The keyboard was reflashed with `dusk67_via_prod.uf2` and re-enumerated as
-`Bus 001 Device 014: ID 9d5b:2406`. Measured on the live device:
+`Bus 001 Device 014: ID 9d5b:2406`. The flashed UF2 is **byte-identical** to a
+fresh build of the committed tree (md5 `719bd42bcb074dcce855703d85523506`, bin
+`93dfabcb4d5e012f9f41cbaba2540a3b`, 30564 B) — re-measured this session, so
+"the board is running this source" is established, not assumed.
+
+Measured on the live device:
 
 - `get_protocol_version` -> **0x0D (13)** on `/dev/hidraw2`
-- `get_keyboard_value uptime` -> **152415 ms** (a fresh boot, not a stale one)
-- `layout_options` -> **0x03000000** (non-zero; the 9 decoded bits are set)
+- `get_keyboard_value firmware_version` -> **0x00000001** (matches
+  `VIA_FIRMWARE_VERSION` in `config.h`)
+- `layout_options` (value id **0x02**) -> **0x00000040** — bit 6 set, i.e. the
+  3-bit CapsLock-colour field reads "Blue". (`0x03000000` recorded in earlier
+  revisions was a mis-read of value id `0x03`; see §4 and §6.6.)
+- **`id_eeprom_reset` (0x0A) is not compiled in** — the reply is absent because
+  `VIA_EEPROM_ALLOW_RESET` is not defined. That is the correct posture: it means
+  the host cannot casually wipe this EEPROM. Recovery is via Esc-bootmagic.
 
-So: **flash OK, VIA OK, protocol 13 OK.** That much is measured, not assumed.
+### 7.1 EEPROM keymap readback — now trustworthy, and verified
 
-**EEPROM readback is NOT yet trustworthy.** Individually-read cells returned the
-right keycodes (`0x2c`=SPC, `0x11`=N, `0x10`=M, `0x36`=COMM, `0x90`=LNG1,
-`0x65`=APP, `0x46`=PSCR, `0x1e`=KC_1, `0x20`=KC_3), but a full 18-row sweep in
-one pass produced a scrambled result. The cause is on the **host** side: the
-device returns stale queued frames, and a reply is identified by
-`reply[0] == command` **and** `reply[1..3]` echoing the row/col you asked for.
-Frames with `reply[0] == 0xFF` are junk. Validate both fields before trusting a
-payload — a 10x read of one cell is stable, a fast bulk sweep is not.
+The earlier claim "EEPROM readback is NOT yet trustworthy" was **wrong about the
+cause** and has been resolved. The scrambling was the host probe, not the board:
+`/dev/hidraw*` hands back **32** bytes (hidapi strips the report ID), so a
+34-byte read never matched. With the length fixed and every reply matched on
+*both* the command echo and the echoed `(layer,row,col)`:
+
+```
+protocol version : 13  (ok)
+frames read: 228  stale (other command/cell): 0  unhandled (0xFF): 0
+OK: all 224 cells match keymap.c
+```
+
+**All 224 cells (layers 0-1 x 14 rows x 8 cols) match `keymap.c`, repeated
+3x consecutively with zero stale frames.** So "the EEPROM holds the keymap"
+is now **confirmed**, not assumed. Run it yourself:
+
+```bash
+python3 keyboards/ydkb/unicore_f1/via_readback.py
+```
+
+Ground truth for "what should be there" is the ELF, not the source: `keymaps`
+lives at `0x0800abb8`, and the disassembly confirms every cell (e.g. (0,0) =
+`16 7c` little-endian = `0x7C16` = `QK_GESC`).
 
 Wire format, measured and confirmed against `quantum/via.c`:
 
@@ -192,30 +262,124 @@ The keycode args are **(layer, row, column)** — *not* a flat offset. An early
 probe passed a flat offset and decoded bytes [4:6] and produced confident
 garbage; treat any readback script that does not echo-check as unverified.
 
-Because of this, "the EEPROM holds the new keymap" is still **unconfirmed**.
-Confirm by one-off reads (or the VIA Configurator's own keymap editor) rather
-than trusting a scripted bulk sweep. See §8 step 1.
+For the buffer commands (`0x12`/`0x13`) the args are different: `offset` is a
+**2-byte big-endian** value at `[2..3]` and `size` (max 28) is at `[4]`. Reading
+those with a single offset byte silently yields zeros and looks like a wiped
+keymap.
+
+### 7.2 An EEPROM reset command damaged 8 cells — do not send 0x06 casually
+
+While diagnosing, I sent `id_dynamic_keymap_reset` (**0x06**) to the live board.
+It reseeds the keymap from flash, and it left **8 cells wrong**:
+
+| cell | before/after reset | flash (correct) |
+|---|---|---|
+| L0 (8,1) | `0x0000` | `0x0046` KC_PRINT_SCREEN |
+| L1 (5,0) | `0x00a9` | `0x004d` KC_END |
+| L1 (5,1) | `0x00aa` | `0x004e` KC_PGDN |
+| L1 (5,2) | `0x00a8` | `0x004a` KC_HOME |
+| L1 (5,6) | `0x0001` | `0x004b` KC_PGUP |
+| L1 (8,0) | `0x0001` | `0x0039` KC_CAPS_LOCK |
+| L1 (8,1) | `0x0001` | `0x0047` KC_SCROLL_LOCK |
+| L1 (8,2) | `0x0001` | `0x0053` KC_NUM_LOCK |
+
+Properties measured about this, so it is not re-derived:
+
+- The MCU does **not** reboot (uptime kept counting through the reset), so this
+  is not a reset-interrupt artifact.
+- Individual writes (`0x05`) work and do not alias: a `0xABCD` sentinel written
+  to L1 (5,0) read back exactly and left L1 (6,0) and L0 (5,0) untouched.
+- The pattern is **value-shaped, not position-shaped**: the wrong values are the
+  *correct* keycodes for *neighbouring* keys (`0xa9`/`0xaa`/`0xa8` = VOLU/VOLD/
+  MUTE are L1 row 6's values; `0x41`-`0x45` = F8-F12 also row 8). Some cells
+  lost their value, others gained a row-6/row-8 value. Repeated resets
+  reproduce the same 8 cells, so it is deterministic, not wear or noise.
+
+**Root cause: still open.** What has been *ruled out* by measurement, so it is
+not re-derived:
+
+- **Not an EEPROM capacity overflow.** QMK's own assert passes. Measured EEPROM
+  geometry (STM32F103xB, `FEE_PAGE_SIZE` 0x400 x `FEE_PAGE_COUNT` 8, from
+  `config.h`): `FEE_PAGE_BASE_ADDRESS` = `0x0801E000` (matches the linker's 8 KB
+  reservation exactly), compacted area `0x0801E000..0x0801E800` (2048 B),
+  write log `0x0801E800..0x08020000` (6144 B). `DYNAMIC_KEYMAP_EEPROM_START`
+  measured empirically as **264** (sentinel scan — *not* the 42 that the
+  `via.h` macro chain predicts; the difference is `EECONFIG_KB_DATA_SIZE` /
+  `VIA_EEPROM_CUSTOM_CONFIG_SIZE`, which the build injects). Highest cell byte
+  address is 1606, comfortably inside 2048.
+- **Not the 13-bit write-log address field.** `eeprom_write_log_word_entry`
+  masks `address &= 0x1FFF`, which looked like a limit at first. Max address
+  here is 1606 (11 bits after the `<<1`), so nothing is truncated.
+- **Not the `FEE_BYTE_RANGE` (0x80) byte-log/word-log split.** All keymap
+  addresses are >= 264, so every cell takes the word-log path.
+- **Not byte-order or a word-swap inside the cell.** In all 8 failures the high
+  byte is correct and only the **low** byte is wrong — so it is not an
+  endianness bug in `nvm_dynamic_keymap`'s big-endian store.
+- **Not a misaligned/offset read.** Sweeping +-3 cells around each failing
+  index in flash does not reproduce the observed values.
+- **Not a reboot or an interrupted write.** Uptime keeps counting across the
+  reset; the MCU does not restart.
+
+Two further facts worth keeping:
+
+- **Only the low byte is ever wrong**, and the wrong values are *plausible
+  keycodes from elsewhere in the same layer* (`L1(5,0)`=`0xa9`=VOLU which lives
+  at `L1(6,5)`; `L1(5,1)`=`0xaa`=VOLD which lives at `L1(6,4)`; `L1(5,2)`=`0xa8`
+  =MUTE which lives at `L1(5,4)`). Several others simply read `0x0001`. It looks
+  like *stale or misattributed* data rather than erasure.
+- **`id_eeprom_reset` (0x0A) is not compiled in** (`VIA_EEPROM_ALLOW_RESET`
+  undefined), so the host cannot wipe EEPROM wholesale — only 0x06 is reachable.
+
+The remaining suspect is the FEE emulation's **compaction path**
+(`eeprom_compact` -> `eeprom_clear` erases *all* 8 pages, compacted area
+included, then rewrites the compacted image from the RAM cache; note it skips
+words whose value is 0, since `~0x0000 == 0xFFFF == FEE_EMPTY_WORD`). A
+672-write reset is exactly the workload that would push the 6 KB write log to
+full and trigger compaction. **This is a hypothesis, not a finding** — it needs
+the driver's own trace (`DEBUG_EEPROM_OUTPUT`, a commented-out `#define` at
+`eeprom_legacy_emulated_flash.c:159`, so it needs a source edit and a
+console-enabled reflash to observe). That has not been done.
+
+Also note `via_eeprom_is_valid()` encodes `QMK_BUILDDATE` as BCD **YYMMDD**
+(`quantum/via.c:71`, indices 2-3/5-6/8-9 = year, month, day) — so the magic
+only changes when the **calendar date** changes, not per build. A same-day
+reflash therefore does *not* auto-trigger `eeconfig_init_via()`. The magic bytes
+cannot be read back through any command this firmware exposes, so this is
+inferred from the source, not measured on the board.
+
+**Repaired** by writing the 8 flash values back with `0x05`; all 224 cells
+verify clean across repeated runs (`via_readback.py` green). **Treat `0x06` as
+unsafe on this keyboard** until the cause is understood — it is not a recovery
+tool here. If the keymap is ever genuinely lost, use Esc-bootmagic instead.
 
 ## 7b. Current state (as of 2026-10-03)
 
 - Keymap `dusk67_via` **mirrors the user's Vial export** `dusk67.layout.json`
-  exactly on layers 0 and 1 (112 tokens each, 0 diffs). Layers 2–5 are empty in
-  the export and are intentionally left unimplemented in firmware.
+  exactly on layers 0 and 1 (112 tokens each, 0 diffs; `check_keymap.py` green).
+  Layers 2-5 are empty in the export and intentionally unimplemented in
+  firmware — though `DYNAMIC_KEYMAP_LAYER_COUNT` is 6, so the VIA app *will*
+  offer 6 layers and layers 2-5 are simply blank.
 - The export's Vial-only short keycodes were mapped to QMK names:
-  `KC_HAEN→KC_LANGUAGE_1`, `KC_HANJ→KC_LANGUAGE_2`, `KC_SLCK→KC_SCROLL_LOCK`,
-  `KC_NLCK→KC_NUM_LOCK`, `KC_GESC→QK_GESC`, `KC_VOL_UP/DOWN→KC_VOLU/KC_VOLD`.
+  `KC_HAEN->KC_LANGUAGE_1`, `KC_HANJ->KC_LANGUAGE_2`, `KC_SLCK->KC_SCROLL_LOCK`,
+  `KC_NLCK->KC_NUM_LOCK`, `KC_GESC->QK_GESC`, `KC_VOL_UP/DOWN->KC_VOLU/KC_VOLD`.
 - `KC_PRINT_SCREEN` was added at `(8,1)` — a position `keyboard.json` already
   labelled `BL_TOGG` but the firmware left `KC_NO`.
 - Tree is rebased to **`origin/master` tip** (`7a1bbf37c5`), 0 ahead / 0 behind.
-  Build + lint + checker all green after the rebase.
-- Flashed and VIA-live (§7). EEPROM keymap readback still unconfirmed (§7).
+  Build + lint + both static checkers green after the rebase.
+- Flashed, VIA-live, and **EEPROM keymap readback verified against the ELF**
+  (§7.1). Outstanding: the `0x06` reset defect in §7.2. Root cause **not
+  established**; capacity, address-width, byte-order, misalignment, alignment and
+  reboot hypotheses are all measured and excluded, and the compaction path
+  remains an untested hypothesis.
 
 ## 8. If you are handed a new bug while using the keyboard
 
 Fast triage, in order:
 
 1. Is it *reproducible with the board unplugged and replugged*? If yes, likely
-   EEPROM/keymap, not runtime. Reflash (§3) and read back the keymap (§4).
+   EEPROM/keymap, not runtime. Reflash (§3) and run `via_readback.py` (§7.1) —
+   it names the exact cells that disagree with flash. Do **not** try to fix it
+   by sending VIA `0x06`; that command is itself unsafe here (§7.2).
 2. Is USB dropping mid-typing? That is the **HSI tear-off** issue — go to
    `USB_SOF_TRIM_PLAN.md`, not here. It is a clock problem, and no VIA log will
    show it because a dead transport silences the log exactly when you need it.
