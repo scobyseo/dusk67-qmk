@@ -1,0 +1,6 @@
+# Build artifacts and reference files: large, and regenerable.
+*.uf2
+*.bin
+*.hex
+*.elf
+*.map
